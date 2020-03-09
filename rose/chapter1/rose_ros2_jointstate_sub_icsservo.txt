@@ -1,0 +1,294 @@
+#include <Arduino.h>
+#include <WiFiEsp.h>
+#include <Ethernet.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <limits.h>
+
+#include <uxr/client/client.h>
+#include <ucdr/microcdr.h>
+
+extern "C" {
+#include <FreeRTOS.h>
+#include <task.h>
+}
+#include <JointState.h>
+#include <ICS.h>
+
+#define KRS_MIN 3500
+#define KRS_MAX 11500
+#define KRS_ORG 7500
+#define KRS_FREE 0
+#define SERVO_MIN -135
+#define SERVO_MAX 135
+IcsController ICS(Serial1);
+IcsServo roll;
+IcsServo pitch;
+IcsServo yaw;
+
+// Micro-XRCE-DDS-Client key identifier of the client.
+// If multiple clients connect to the same agent, each client must have a different key.
+#define CLIENT_KEY      0xCCCCDDD1
+
+#define BUFFER_SIZE     UXR_CONFIG_UDP_TRANSPORT_MTU
+
+char ssid[] = "ssid";        // your network SSID (name)
+char pass[] = "pass";        // your network password
+int status = WL_IDLE_STATUS; // the Wifi radio's status
+byte mac[] = { 
+  0x74, 0x90, 0x50, 0x00, 0x79, 0x03 };
+IPAddress ip(192, 168, 2, 52);
+
+uxrSession session;
+uxrUDPTransport transport;
+uxrUDPPlatform udp_platform;
+uxrStreamId output_stream;
+uxrStreamId input_stream;
+static char agent_ip[32] = { 0 };
+
+uint8_t output_best_effort_stream_buffer[BUFFER_SIZE];
+uint8_t input_best_effort_stream_buffer[BUFFER_SIZE];
+
+static bool use_ethernet = false;
+
+void on_topic(uxrSession* session, uxrObjectId object_id, uint16_t request_id, uxrStreamId stream_id, struct ucdrBuffer* mb, void* args);
+void on_agent_found(const uxrAgentAddress* address, void* args);
+static void prvUXRManagerTask(void * pvParameters);
+
+void setup() {
+  // Initialize the LED pin
+  pinMode(PIN_LED1, OUTPUT);
+  
+  // Initialize Servos
+  ICS.begin();
+  yaw.attach(ICS, 1);
+  pitch.attach(ICS, 2);
+  roll.attach(ICS, 3);
+  yaw.setPosition(KRS_ORG);
+  delay(1);
+  pitch.setPosition(KRS_ORG);
+  delay(1);
+  roll.setPosition(KRS_ORG);
+  delay(1);
+
+  // Initialize Network
+  if(!use_ethernet)
+  {
+    // initialize serial for debugging
+    Serial.begin(115200);
+    // initialize serial for ESP module
+    Serial6.begin(115200);
+    // initialize ESP module
+    WiFi.init(&Serial6);
+  }
+  else
+  {
+    // Serial output to USB
+    Serial.begin(9600);
+  }
+
+  if(!use_ethernet)
+  {
+    // check for the presence of the shield
+    if (WiFi.status() == WL_NO_SHIELD) {
+      Serial.println("WiFi shield not present");
+      // don't continue
+      while (true);
+    }
+    // attempt to connect to WiFi network
+    while ( status != WL_CONNECTED) {
+      Serial.print("Attempting to connect to WPA SSID: ");
+      Serial.println(ssid);
+      // Connect to WPA/WPA2 network
+      status = WiFi.begin(ssid, pass);
+    }
+  }
+  else
+  {
+    // Setting IP
+    Ethernet.begin(mac, ip);
+  }
+
+  // Wait for network configuration
+  vTaskDelay(5000);
+
+  // Discovery Agent
+  Serial.println("Discovery Agent...");
+  uxrAgentAddress chosen;
+  chosen.ip = agent_ip;
+
+  // Choose Ethernet or WiFi
+  uxr_discovery_choose_ethernet(use_ethernet);
+
+  // Try forever until Agent is found
+  uxr_discovery_agents_default(INT_MAX, 1000, on_agent_found, &chosen);
+
+  Serial.print("Chosen agent => ip: ");
+  Serial.print(chosen.ip);
+  Serial.print(", port: ");
+  Serial.println(chosen.port);
+
+  // Transport
+  udp_platform.use_ethernet = use_ethernet;
+  if (!uxr_init_udp_transport(&transport, &udp_platform, chosen.ip, chosen.port))
+  {
+    Serial.println("Error at create transport.");
+    return;
+  }
+
+  // Session
+  uxr_init_session(&session, &transport.comm, CLIENT_KEY);
+  uxr_set_topic_callback(&session, on_topic, NULL);
+  if (!uxr_create_session(&session))
+  {
+    Serial.println("Error at create session.");
+    return;
+  }
+
+  // Streams
+  output_stream = uxr_create_output_best_effort_stream(&session, output_best_effort_stream_buffer, BUFFER_SIZE);
+  input_stream = uxr_create_input_best_effort_stream(&session);
+
+  // Create entities
+  uxrObjectId participant_id = uxr_object_id(0x01, UXR_PARTICIPANT_ID);
+  const char* participant_xml = 
+   "<dds>"
+    "<participant>"
+     "<rtps>"
+      "<name>default_xrce_participant</name>"
+     "</rtps>"
+    "</participant>"
+   "</dds>";
+  uint16_t participant_req = uxr_buffer_create_participant_xml(&session, output_stream, participant_id, 0, participant_xml, UXR_REPLACE);
+
+  // In order to avoid buffer overflow, uxr_flash_output_streams() has to be
+  // called everytime entities message is created.
+  (void) uxr_flash_output_streams(&session);
+
+  uxrObjectId topic_id = uxr_object_id(0x01, UXR_TOPIC_ID);
+  const char* topic_xml = 
+   "<dds>"
+    "<topic>"
+     "<name>rt/joint_states</name>"
+     "<dataType>sensor_msgs::msg::dds_::JointState_</dataType>"
+    "</topic>"
+   "</dds>";
+  uint16_t topic_req = uxr_buffer_create_topic_xml(&session, output_stream, topic_id, participant_id, topic_xml, UXR_REPLACE);
+
+  // In order to avoid buffer overflow, uxr_flash_output_streams() has to be
+  // called everytime entities message is created.
+  (void) uxr_flash_output_streams(&session);
+
+  uxrObjectId subscriber_id = uxr_object_id(0x01, UXR_SUBSCRIBER_ID);
+  const char* subscriber_xml = "";
+  uint16_t subscriber_req = uxr_buffer_create_subscriber_xml(&session, output_stream, subscriber_id, participant_id, subscriber_xml, UXR_REPLACE);
+
+  // In order to avoid buffer overflow, uxr_flash_output_streams() has to be
+  // called everytime entities message is created.
+  (void) uxr_flash_output_streams(&session);
+
+  uxrObjectId datareader_id = uxr_object_id(0x01, UXR_DATAREADER_ID);
+  const char* datareader_xml = 
+   "<dds>"
+    "<data_reader>"
+     "<topic>"
+      "<kind>NO_KEY</kind>"
+      "<name>rt/joint_states</name>"
+      "<dataType>sensor_msgs::msg::dds_::JointState_</dataType>"
+     "</topic>"
+    "</data_reader>"
+   "</dds>";
+  uint16_t datareader_req = uxr_buffer_create_datareader_xml(&session, output_stream, datareader_id, subscriber_id, datareader_xml, UXR_REPLACE);
+
+  // In order to avoid buffer overflow, uxr_flash_output_streams() has to be
+  // called everytime entities message is created.
+  (void) uxr_flash_output_streams(&session);
+
+  // Request topics
+  uxrDeliveryControl delivery_control = {
+    0  };
+  delivery_control.max_samples = UXR_MAX_SAMPLES_UNLIMITED;
+  (void) uxr_buffer_request_data(&session, output_stream, datareader_id, input_stream, &delivery_control);
+
+  xTaskCreate(prvUXRManagerTask, "ListenerDemo", configMINIMAL_STACK_SIZE * 5, NULL, 2, NULL);
+}
+
+void loop() {
+  // Do nothing
+  vTaskDelay(10000);
+}
+
+void on_topic(uxrSession* session, uxrObjectId object_id, uint16_t request_id, uxrStreamId stream_id, struct ucdrBuffer* mb, void* args) {
+  (void) session; 
+  (void) object_id; 
+  (void) request_id; 
+  (void) stream_id;
+
+  JointState topic;
+  JointState_deserialize_topic(mb, &topic);
+
+  Serial.println("Received topic: ");
+  for(int i = 0; i < topic.position_size; i++){
+    Serial.print((char*)topic.name[i]);
+    Serial.print("\t");
+    Serial.print(topic.position[i]);
+    Serial.println();
+  }
+  float radian_roll   = topic.position[0];
+  float radian_pitch  = topic.position[1];
+  float radian_yaw    = topic.position[2];
+  int axis_roll       = radian_roll  * 180 / PI;
+  int axis_pitch      = radian_pitch * 180 / PI;
+  int axis_yaw        = radian_yaw   * 180 / PI;
+  int pos_roll        = map(axis_roll,  SERVO_MIN, SERVO_MAX, KRS_MIN, KRS_MAX);
+  int pos_pitch       = map(axis_pitch, SERVO_MIN, SERVO_MAX, KRS_MIN, KRS_MAX);
+  int pos_yaw         = map(axis_yaw,   SERVO_MIN, SERVO_MAX, KRS_MIN, KRS_MAX);
+  
+  if(pos_roll > KRS_MIN && pos_roll < KRS_MAX){
+    roll.setPosition(pos_roll);
+    delay(1);
+  }
+  if(pos_pitch > KRS_MIN && pos_pitch < KRS_MAX){
+    pitch.setPosition(pos_pitch);
+    delay(1);
+  }
+  if(pos_yaw > KRS_MIN && pos_yaw < KRS_MAX){
+    yaw.setPosition(pos_yaw);
+    delay(1);
+  }
+
+  // Toggle the heartbeat LED
+  digitalWrite(PIN_LED1, !digitalRead(PIN_LED1));
+}
+
+void on_agent_found(const uxrAgentAddress* address, void* args) {
+  uxrAgentAddress* agent = (uxrAgentAddress*)args;
+
+  Serial.print("Found agent => ip: ");
+  Serial.print(address->ip);
+  Serial.print(", port: ");
+  Serial.println(address->port);
+
+  memcpy((void*)(agent->ip), address->ip, 32);
+  agent->port = address->port;
+}
+
+static void prvUXRManagerTask(void * pvParameters) {
+  // Cannot confirm whether client is connected to agent or not.
+  while (1)
+  {
+    // Receive topics
+    (void) uxr_run_session_time(&session, 1);
+
+    vTaskDelay(1);
+  }
+
+  // Delete resources
+  (void) uxr_delete_session(&session);
+  (void) uxr_close_udp_transport(&transport);
+
+  // Delete this task
+  vTaskDelete(NULL);
+}
+
